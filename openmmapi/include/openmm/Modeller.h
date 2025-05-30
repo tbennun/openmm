@@ -258,6 +258,19 @@ public:
      * Get the currently loaded hydrogen definitions.
      */
     static const std::map<std::string, ResidueHydrogenData>& getHydrogenDefinitions();
+    
+    /**
+     * Add missing hydrogens to the model.
+     * This is a high-performance C++ implementation of hydrogen addition.
+     * 
+     * @param selectedVariants output parameter - what variant was selected for each residue
+     * @param pH          the pH based on which to select variants
+     * @param variants    optional list of variants to use for each residue
+     * @return true if hydrogens were successfully added
+     */
+    bool addHydrogens(std::vector<std::string>& selectedVariants,
+                     double pH = 7.0,
+                     const std::vector<std::string>& variants = std::vector<std::string>());
 
 private:
     ModellerImpl* impl;

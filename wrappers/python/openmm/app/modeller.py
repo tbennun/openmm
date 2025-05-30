@@ -548,7 +548,27 @@ class Modeller(object):
             self._positions_dirty = False
 
     def addHydrogens(self, forcefield, pH=7.0, variants=None, platform=None, residueTemplates=dict()):
-        # Import the original implementation
+        # Try C++ implementation first if available
+        if self._cpp_modeller is not None:
+            # Ensure hydrogen definitions are loaded
+            self._ensure_hydrogen_definitions_loaded()
+            
+            # Convert variants parameter
+            cpp_variants = []
+            if variants is not None:
+                cpp_variants = [v if v is not None else "" for v in variants]
+            
+            # Try C++ implementation
+            selected_variants = []
+            success = self._cpp_modeller.addHydrogens(selected_variants, pH, cpp_variants)
+            
+            if success:
+                # C++ implementation succeeded, mark as dirty for lazy sync
+                self._topology_dirty = True
+                self._positions_dirty = True
+                return selected_variants
+        
+        # Fall back to original Python implementation
         from . import modeller_original as original_modeller
         # Create temporary instance with original implementation
         temp_modeller = original_modeller.Modeller(self.topology, self.positions)

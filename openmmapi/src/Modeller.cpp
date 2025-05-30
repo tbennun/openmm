@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <unordered_set>
 #include <unordered_map>
+#include <set>
 
 using namespace OpenMM;
 using namespace std;
@@ -415,4 +416,60 @@ void Modeller::loadHydrogenDefinitions(const map<string, ResidueHydrogenData>& r
 
 const map<string, Modeller::ResidueHydrogenData>& Modeller::getHydrogenDefinitions() {
     return residueHydrogens;
+}
+
+bool Modeller::addHydrogens(vector<string>& selectedVariants,
+                           double pH,
+                           const vector<string>& variants) {
+    // For now, this is a placeholder that delegates to Python for complex logic
+    // TODO: Implement full C++ version of hydrogen addition algorithm
+    
+    // Ensure hydrogen definitions are loaded
+    if (residueHydrogens.empty()) {
+        return false; // Cannot proceed without hydrogen definitions
+    }
+    
+    // Initialize selectedVariants array
+    selectedVariants.clear();
+    selectedVariants.resize(impl->residues.size());
+    
+    // For each residue, determine the appropriate variant based on pH and other factors
+    for (size_t i = 0; i < impl->residues.size(); ++i) {
+        const auto& residue = impl->residues[i];
+        string variant;
+        
+        // Use provided variant if available
+        if (i < variants.size() && !variants[i].empty()) {
+            variant = variants[i];
+        } else {
+            // Auto-select variant based on pH and residue type
+            // This is a simplified version - the full algorithm is complex
+            auto hydrogenDataIt = residueHydrogens.find(residue.name);
+            if (hydrogenDataIt != residueHydrogens.end()) {
+                // Simple pH-based selection for common amino acids
+                if (residue.name == "ASP") {
+                    variant = (pH < 3.9) ? "ASH" : "ASP";
+                } else if (residue.name == "GLU") {
+                    variant = (pH < 4.3) ? "GLH" : "GLU";
+                } else if (residue.name == "HIS") {
+                    variant = (pH > 6.0) ? "HIP" : "HID"; // Simplified - real version checks hydrogen bonds
+                } else if (residue.name == "LYS") {
+                    variant = (pH < 10.5) ? "LYS" : "LYN";
+                } else if (residue.name == "CYS") {
+                    variant = "CYS"; // TODO: Check for disulfide bonds
+                } else {
+                    // Use first available variant
+                    if (!hydrogenDataIt->second.variants.empty()) {
+                        variant = hydrogenDataIt->second.variants[0];
+                    }
+                }
+            }
+        }
+        
+        selectedVariants[i] = variant;
+    }
+    
+    // TODO: Actually add the hydrogen atoms and positions
+    // For now, return false to indicate this is not fully implemented
+    return false;
 }
