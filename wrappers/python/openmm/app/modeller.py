@@ -533,7 +533,55 @@ class Modeller(object):
             self._positions_dirty = False
 
     def addSolvent(self, forcefield, model='tip3p', boxSize=None, boxVectors=None, padding=None, numAdded=None, boxShape='cube', positiveIon='Na+', negativeIon='Cl-', ionicStrength=0*molar, neutralize=True, residueTemplates=dict()):
-        # Import the original implementation
+        # Try C++ implementation first if available
+        if self._cpp_modeller is not None:
+            # Convert parameters to C++ format
+            cpp_boxSize = Vec3(0, 0, 0)
+            if boxSize is not None:
+                if is_quantity(boxSize):
+                    boxSize_nm = boxSize.value_in_unit(nanometer)
+                else:
+                    boxSize_nm = boxSize
+                cpp_boxSize = Vec3(boxSize_nm[0], boxSize_nm[1], boxSize_nm[2])
+            
+            cpp_boxVectors = []
+            if boxVectors is not None:
+                for vec in boxVectors:
+                    if is_quantity(vec):
+                        vec_nm = vec.value_in_unit(nanometer)
+                    else:
+                        vec_nm = vec
+                    cpp_boxVectors.append(Vec3(vec_nm[0], vec_nm[1], vec_nm[2]))
+            
+            cpp_padding = 0.0
+            if padding is not None:
+                if is_quantity(padding):
+                    cpp_padding = padding.value_in_unit(nanometer)
+                else:
+                    cpp_padding = padding
+            
+            cpp_numAdded = numAdded if numAdded is not None else 0
+            
+            cpp_ionicStrength = 0.0
+            if ionicStrength is not None:
+                if is_quantity(ionicStrength):
+                    cpp_ionicStrength = ionicStrength.value_in_unit(molar)
+                else:
+                    cpp_ionicStrength = ionicStrength
+            
+            # Try C++ implementation
+            success = self._cpp_modeller.addSolvent(
+                model, cpp_boxSize, cpp_boxVectors, cpp_padding, cpp_numAdded,
+                boxShape, positiveIon, negativeIon, cpp_ionicStrength, neutralize
+            )
+            
+            if success:
+                # C++ implementation succeeded, mark as dirty for lazy sync
+                self._topology_dirty = True
+                self._positions_dirty = True
+                return
+        
+        # Fall back to original Python implementation
         from . import modeller_original as original_modeller
         # Create temporary instance with original implementation
         temp_modeller = original_modeller.Modeller(self.topology, self.positions)

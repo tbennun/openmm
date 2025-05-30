@@ -35,6 +35,7 @@
 #include <unordered_set>
 #include <unordered_map>
 #include <set>
+#include <cmath>
 
 using namespace OpenMM;
 using namespace std;
@@ -421,9 +422,6 @@ const map<string, Modeller::ResidueHydrogenData>& Modeller::getHydrogenDefinitio
 bool Modeller::addHydrogens(vector<string>& selectedVariants,
                            double pH,
                            const vector<string>& variants) {
-    // For now, this is a placeholder that delegates to Python for complex logic
-    // TODO: Implement full C++ version of hydrogen addition algorithm
-    
     // Ensure hydrogen definitions are loaded
     if (residueHydrogens.empty()) {
         return false; // Cannot proceed without hydrogen definitions
@@ -433,43 +431,326 @@ bool Modeller::addHydrogens(vector<string>& selectedVariants,
     selectedVariants.clear();
     selectedVariants.resize(impl->residues.size());
     
-    // For each residue, determine the appropriate variant based on pH and other factors
-    for (size_t i = 0; i < impl->residues.size(); ++i) {
-        const auto& residue = impl->residues[i];
+    // Build bonding information
+    unordered_map<int, vector<int>> bondedAtoms;
+    for (const auto& atom : impl->atoms) {
+        bondedAtoms[atom.index] = vector<int>();
+    }
+    for (const auto& bond : impl->bonds) {
+        bondedAtoms[bond.atom1Index].push_back(bond.atom2Index);
+        bondedAtoms[bond.atom2Index].push_back(bond.atom1Index);
+    }
+    
+    // Track new atoms to add
+    vector<Atom> newAtoms;
+    vector<Vec3> newPositions;
+    vector<Bond> newBonds;
+    
+    // For each residue, determine variant and add hydrogens
+    for (size_t resIdx = 0; resIdx < impl->residues.size(); ++resIdx) {
+        const auto& residue = impl->residues[resIdx];
         string variant;
         
         // Use provided variant if available
-        if (i < variants.size() && !variants[i].empty()) {
-            variant = variants[i];
+        if (resIdx < variants.size() && !variants[resIdx].empty()) {
+            variant = variants[resIdx];
         } else {
             // Auto-select variant based on pH and residue type
-            // This is a simplified version - the full algorithm is complex
             auto hydrogenDataIt = residueHydrogens.find(residue.name);
             if (hydrogenDataIt != residueHydrogens.end()) {
-                // Simple pH-based selection for common amino acids
-                if (residue.name == "ASP") {
-                    variant = (pH < 3.9) ? "ASH" : "ASP";
-                } else if (residue.name == "GLU") {
-                    variant = (pH < 4.3) ? "GLH" : "GLU";
-                } else if (residue.name == "HIS") {
-                    variant = (pH > 6.0) ? "HIP" : "HID"; // Simplified - real version checks hydrogen bonds
-                } else if (residue.name == "LYS") {
-                    variant = (pH < 10.5) ? "LYS" : "LYN";
-                } else if (residue.name == "CYS") {
-                    variant = "CYS"; // TODO: Check for disulfide bonds
-                } else {
-                    // Use first available variant
-                    if (!hydrogenDataIt->second.variants.empty()) {
-                        variant = hydrogenDataIt->second.variants[0];
+                variant = selectVariantForResidue(residue, pH, bondedAtoms);
+            } else {
+                variant = residue.name; // Use residue name as default
+            }
+        }
+        
+        selectedVariants[resIdx] = variant;
+        
+        // Add hydrogens for this variant
+        addHydrogensForVariant(residue, variant, bondedAtoms, newAtoms, newPositions, newBonds);
+    }
+    
+    // Add all new atoms, positions, and bonds
+    if (!newAtoms.empty()) {
+        int baseAtomIndex = impl->atoms.size();
+        
+        // Update atom indices and residue references
+        for (size_t i = 0; i < newAtoms.size(); ++i) {
+            newAtoms[i].index = baseAtomIndex + i;
+            
+            // Add to residue's atom list
+            int resIdx = newAtoms[i].residueIndex;
+            if (resIdx < (int)impl->residues.size()) {
+                impl->residues[resIdx].atomIndices.push_back(newAtoms[i].index);
+            }
+        }
+        
+        // Update bond indices
+        for (auto& bond : newBonds) {
+            if (bond.atom1Index >= baseAtomIndex) bond.atom1Index += baseAtomIndex;
+            if (bond.atom2Index >= baseAtomIndex) bond.atom2Index += baseAtomIndex;
+        }
+        
+        // Add to main vectors
+        impl->atoms.insert(impl->atoms.end(), newAtoms.begin(), newAtoms.end());
+        impl->positions.insert(impl->positions.end(), newPositions.begin(), newPositions.end());
+        impl->bonds.insert(impl->bonds.end(), newBonds.begin(), newBonds.end());
+        
+        return true;
+    }
+    
+    return false; // No hydrogens were added
+}
+
+string Modeller::selectVariantForResidue(const Residue& residue, double pH,
+                                        const unordered_map<int, vector<int>>& bondedAtoms) {
+    // Handle special cases for variant selection
+    if (residue.name == "CYS") {
+        // Check for disulfide bonds by looking for sulfur atoms bonded to other residues
+        for (int atomIdx : residue.atomIndices) {
+            if (atomIdx < (int)impl->atoms.size()) {
+                const auto& atom = impl->atoms[atomIdx];
+                if (atom.element == 16) { // Sulfur
+                    for (int bondedIdx : bondedAtoms.at(atomIdx)) {
+                        if (bondedIdx < (int)impl->atoms.size()) {
+                            const auto& bondedAtom = impl->atoms[bondedIdx];
+                            if (bondedAtom.residueIndex != residue.index) {
+                                return "CYX"; // Disulfide bond found
+                            }
+                        }
                     }
                 }
             }
         }
-        
-        selectedVariants[i] = variant;
+        return "CYS";
     }
     
-    // TODO: Actually add the hydrogen atoms and positions
-    // For now, return false to indicate this is not fully implemented
-    return false;
+    // pH-based selection for ionizable residues
+    if (residue.name == "ASP") {
+        return (pH < 3.9) ? "ASH" : "ASP";
+    } else if (residue.name == "GLU") {
+        return (pH < 4.3) ? "GLH" : "GLU";
+    } else if (residue.name == "LYS") {
+        return (pH < 10.5) ? "LYS" : "LYN";
+    } else if (residue.name == "HIS") {
+        return selectHistidineVariant(residue, pH, bondedAtoms);
+    }
+    
+    // Default: use residue name or first variant
+    auto hydrogenDataIt = residueHydrogens.find(residue.name);
+    if (hydrogenDataIt != residueHydrogens.end() && !hydrogenDataIt->second.variants.empty()) {
+        return hydrogenDataIt->second.variants[0];
+    }
+    
+    return residue.name;
+}
+
+string Modeller::selectHistidineVariant(const Residue& residue, double pH,
+                                       const unordered_map<int, vector<int>>& bondedAtoms) {
+    if (pH <= 6.5) {
+        return "HID"; // Neutral at low pH
+    }
+    
+    // Check for existing hydrogens on ND1 and NE2
+    bool nd1HasHydrogen = false, ne2HasHydrogen = false;
+    
+    for (int atomIdx : residue.atomIndices) {
+        if (atomIdx < (int)impl->atoms.size()) {
+            const auto& atom = impl->atoms[atomIdx];
+            if (atom.name == "ND1" || atom.name == "NE2") {
+                for (int bondedIdx : bondedAtoms.at(atomIdx)) {
+                    if (bondedIdx < (int)impl->atoms.size()) {
+                        const auto& bondedAtom = impl->atoms[bondedIdx];
+                        if (bondedAtom.element == 1) { // Hydrogen
+                            if (atom.name == "ND1") nd1HasHydrogen = true;
+                            if (atom.name == "NE2") ne2HasHydrogen = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    if (nd1HasHydrogen && ne2HasHydrogen) return "HIP";
+    if (nd1HasHydrogen) return "HID";
+    if (ne2HasHydrogen) return "HIE";
+    
+    // Default to HID for simplicity (real implementation would check hydrogen bonding)
+    return "HID";
+}
+
+void Modeller::addHydrogensForVariant(const Residue& residue, const string& variant,
+                                     const unordered_map<int, vector<int>>& bondedAtoms,
+                                     vector<Atom>& newAtoms, vector<Vec3>& newPositions,
+                                     vector<Bond>& newBonds) {
+    auto hydrogenDataIt = residueHydrogens.find(variant);
+    if (hydrogenDataIt == residueHydrogens.end()) {
+        return; // No hydrogen definitions for this variant
+    }
+    
+    const auto& hydrogenData = hydrogenDataIt->second;
+    
+    // Create atom name to index mapping for this residue
+    unordered_map<string, int> atomNameToIndex;
+    for (int atomIdx : residue.atomIndices) {
+        if (atomIdx < (int)impl->atoms.size()) {
+            const auto& atom = impl->atoms[atomIdx];
+            atomNameToIndex[atom.name] = atomIdx;
+        }
+    }
+    
+    // Add each hydrogen defined for this variant
+    for (const auto& hydrogenDef : hydrogenData.hydrogens) {
+        // Check if hydrogen should be added based on pH
+        if (hydrogenDef.maxph > 0 && hydrogenDef.maxph < 14.0) {
+            // This hydrogen is pH-dependent, skip if not applicable
+            continue;
+        }
+        
+        // Find parent atom
+        auto parentIt = atomNameToIndex.find(hydrogenDef.parent);
+        if (parentIt == atomNameToIndex.end()) {
+            continue; // Parent atom not found
+        }
+        
+        int parentAtomIdx = parentIt->second;
+        
+        // Check if hydrogen already exists
+        bool hydrogenExists = false;
+        for (int bondedIdx : bondedAtoms.at(parentAtomIdx)) {
+            if (bondedIdx < (int)impl->atoms.size()) {
+                const auto& bondedAtom = impl->atoms[bondedIdx];
+                if (bondedAtom.element == 1 && bondedAtom.name == hydrogenDef.name) {
+                    hydrogenExists = true;
+                    break;
+                }
+            }
+        }
+        
+        if (hydrogenExists) {
+            continue; // Hydrogen already present
+        }
+        
+        // Calculate hydrogen position using simple tetrahedral geometry
+        Vec3 hydrogenPos = calculateHydrogenPosition(parentAtomIdx, bondedAtoms);
+        
+        // Create new hydrogen atom
+        int newAtomIndex = impl->atoms.size() + newAtoms.size();
+        Atom newHydrogen(hydrogenDef.name, 1, newAtomIndex, residue.index);
+        
+        newAtoms.push_back(newHydrogen);
+        newPositions.push_back(hydrogenPos);
+        
+        // Create bond to parent
+        Bond newBond(parentAtomIdx, newAtomIndex, 1, 1.0); // Single bond
+        newBonds.push_back(newBond);
+    }
+}
+
+Vec3 Modeller::calculateHydrogenPosition(int parentAtomIdx,
+                                        const unordered_map<int, vector<int>>& bondedAtoms) {
+    if (parentAtomIdx >= (int)impl->atoms.size()) {
+        return Vec3(0, 0, 0);
+    }
+    
+    const Vec3& parentPos = impl->positions[parentAtomIdx];
+    const auto& bondedIndices = bondedAtoms.at(parentAtomIdx);
+    
+    // Default bond length for hydrogen (approximately 1 Angstrom)
+    double bondLength = 0.1; // nanometers
+    
+    if (bondedIndices.empty()) {
+        // No bonded atoms, place hydrogen arbitrarily
+        return parentPos + Vec3(bondLength, 0, 0);
+    }
+    
+    // Calculate average direction to bonded atoms
+    Vec3 avgDirection(0, 0, 0);
+    for (int bondedIdx : bondedIndices) {
+        if (bondedIdx < (int)impl->positions.size()) {
+            Vec3 direction = parentPos - impl->positions[bondedIdx];
+            double length = sqrt(direction[0]*direction[0] + direction[1]*direction[1] + direction[2]*direction[2]);
+            if (length > 0) {
+                direction = direction * (1.0/length);
+                avgDirection = avgDirection + direction;
+            }
+        }
+    }
+    
+    // Normalize average direction
+    double avgLength = sqrt(avgDirection[0]*avgDirection[0] + avgDirection[1]*avgDirection[1] + avgDirection[2]*avgDirection[2]);
+    if (avgLength > 0) {
+        avgDirection = avgDirection * (1.0/avgLength);
+    } else {
+        // If all directions cancel out, choose arbitrary direction
+        avgDirection = Vec3(1, 0, 0);
+    }
+    
+    // Place hydrogen in the opposite direction
+    return parentPos + avgDirection * bondLength;
+}
+
+bool Modeller::addSolvent(const string& model,
+                         const Vec3& boxSize,
+                         const vector<Vec3>& boxVectors,
+                         double padding,
+                         int numAdded,
+                         const string& boxShape,
+                         const string& positiveIon,
+                         const string& negativeIon,
+                         double ionicStrength,
+                         bool neutralize) {
+    // This is a complex algorithm that involves:
+    // 1. Creating a box of water molecules
+    // 2. Removing waters that overlap with solute
+    // 3. Adding ions for neutralization and ionic strength
+    // 
+    // For now, implement a simplified version that returns false
+    // to delegate to the Python implementation, but provides the framework
+    // for future full implementation.
+    
+    // Determine box vectors
+    vector<Vec3> finalBoxVectors = boxVectors;
+    
+    if (finalBoxVectors.empty()) {
+        if (boxSize[0] > 0 && boxSize[1] > 0 && boxSize[2] > 0) {
+            // Use provided box size
+            finalBoxVectors.push_back(Vec3(boxSize[0], 0, 0));
+            finalBoxVectors.push_back(Vec3(0, boxSize[1], 0));
+            finalBoxVectors.push_back(Vec3(0, 0, boxSize[2]));
+        } else if (padding > 0) {
+            // Calculate box size from padding
+            Vec3 minPos(1e10, 1e10, 1e10);
+            Vec3 maxPos(-1e10, -1e10, -1e10);
+            
+            for (const auto& pos : impl->positions) {
+                minPos = Vec3(min(minPos[0], pos[0]), min(minPos[1], pos[1]), min(minPos[2], pos[2]));
+                maxPos = Vec3(max(maxPos[0], pos[0]), max(maxPos[1], pos[1]), max(maxPos[2], pos[2]));
+            }
+            
+            Vec3 size = maxPos - minPos + Vec3(2*padding, 2*padding, 2*padding);
+            finalBoxVectors.push_back(Vec3(size[0], 0, 0));
+            finalBoxVectors.push_back(Vec3(0, size[1], 0));
+            finalBoxVectors.push_back(Vec3(0, 0, size[2]));
+        } else {
+            // Use existing box vectors if available
+            finalBoxVectors = impl->periodicBoxVectors;
+        }
+    }
+    
+    if (finalBoxVectors.size() != 3) {
+        return false; // Cannot determine valid box vectors
+    }
+    
+    // Set the box vectors
+    impl->periodicBoxVectors = finalBoxVectors;
+    
+    // For now, delegate complex solvent addition to Python
+    // TODO: Implement full C++ version with:
+    // - Water molecule placement in lattice
+    // - Overlap detection and removal
+    // - Ion placement
+    // - Proper handling of different water models
+    
+    return false; // Indicates to fall back to Python implementation
 }

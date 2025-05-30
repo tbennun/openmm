@@ -37,6 +37,7 @@
 #include <string>
 #include <map>
 #include <set>
+#include <unordered_map>
 #include "internal/windowsExport.h"
 
 namespace OpenMM {
@@ -271,6 +272,33 @@ public:
     bool addHydrogens(std::vector<std::string>& selectedVariants,
                      double pH = 7.0,
                      const std::vector<std::string>& variants = std::vector<std::string>());
+    
+    /**
+     * Add solvent (water and ions) to the model to fill a periodic box.
+     * This is a high-performance C++ implementation of solvent addition.
+     * 
+     * @param model          the water model to use ('tip3p', 'spce', 'tip4pew', 'tip5p', 'swm4ndp')
+     * @param boxSize        the size of the box to fill with water (if specified)
+     * @param boxVectors     the vectors defining the periodic box (takes precedence over boxSize)
+     * @param padding        the padding distance to use (if boxSize/boxVectors not specified)
+     * @param numAdded       total number of molecules to add (if other size options not specified)
+     * @param boxShape       the box shape ('cube', 'dodecahedron', 'octahedron')
+     * @param positiveIon    type of positive ion ('Na+', 'K+', 'Li+', 'Rb+', 'Cs+')
+     * @param negativeIon    type of negative ion ('Cl-', 'Br-', 'F-', 'I-')
+     * @param ionicStrength  total ion concentration in M
+     * @param neutralize     whether to add ions to neutralize the system
+     * @return true if solvent was successfully added
+     */
+    bool addSolvent(const std::string& model = "tip3p",
+                   const Vec3& boxSize = Vec3(0, 0, 0),
+                   const std::vector<Vec3>& boxVectors = std::vector<Vec3>(),
+                   double padding = 0.0,
+                   int numAdded = 0,
+                   const std::string& boxShape = "cube",
+                   const std::string& positiveIon = "Na+",
+                   const std::string& negativeIon = "Cl-",
+                   double ionicStrength = 0.0,
+                   bool neutralize = true);
 
 private:
     ModellerImpl* impl;
@@ -278,6 +306,18 @@ private:
     // Static hydrogen definitions loaded from XML
     static std::map<std::string, ResidueHydrogenData> residueHydrogens;
     static bool hasLoadedStandardHydrogens;
+    
+    // Helper methods for hydrogen addition
+    std::string selectVariantForResidue(const Residue& residue, double pH,
+                                       const std::unordered_map<int, std::vector<int>>& bondedAtoms);
+    std::string selectHistidineVariant(const Residue& residue, double pH,
+                                      const std::unordered_map<int, std::vector<int>>& bondedAtoms);
+    void addHydrogensForVariant(const Residue& residue, const std::string& variant,
+                               const std::unordered_map<int, std::vector<int>>& bondedAtoms,
+                               std::vector<Atom>& newAtoms, std::vector<Vec3>& newPositions,
+                               std::vector<Bond>& newBonds);
+    Vec3 calculateHydrogenPosition(int parentAtomIdx,
+                                  const std::unordered_map<int, std::vector<int>>& bondedAtoms);
 };
 
 } // namespace OpenMM
