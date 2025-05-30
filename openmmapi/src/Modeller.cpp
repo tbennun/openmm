@@ -485,11 +485,8 @@ bool Modeller::addHydrogens(vector<string>& selectedVariants,
             }
         }
         
-        // Update bond indices
-        for (auto& bond : newBonds) {
-            if (bond.atom1Index >= baseAtomIndex) bond.atom1Index += baseAtomIndex;
-            if (bond.atom2Index >= baseAtomIndex) bond.atom2Index += baseAtomIndex;
-        }
+        // Bond indices are already correct as calculated in addHydrogensForVariant
+        // No adjustment needed
         
         // Add to main vectors
         impl->atoms.insert(impl->atoms.end(), newAtoms.begin(), newAtoms.end());
@@ -499,7 +496,8 @@ bool Modeller::addHydrogens(vector<string>& selectedVariants,
         return true;
     }
     
-    return false; // No hydrogens were added
+    // Return true even if no hydrogens were added - the process completed successfully
+    return true;
 }
 
 string Modeller::selectVariantForResidue(const Residue& residue, double pH,
