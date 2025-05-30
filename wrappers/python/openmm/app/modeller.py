@@ -67,9 +67,15 @@ class Modeller(object):
         ## The list of atom positions
         self.positions = positions
         
+        # Track if topology/positions are dirty and need syncing
+        self._topology_dirty = False
+        self._positions_dirty = False
+        
         # Initialize C++ backend if available
         if CPP_MODELLER_AVAILABLE:
             self._cpp_modeller = self._create_cpp_modeller()
+            # Load hydrogen definitions once into C++ if not already loaded
+            self._ensure_hydrogen_definitions_loaded()
         else:
             self._cpp_modeller = None
 
@@ -167,6 +173,30 @@ class Modeller(object):
                 box_vectors.append(Vec3(vec_nm[0], vec_nm[1], vec_nm[2]))
         
         return CppModeller(chains, residues, atoms, bonds, positions_vec, box_vectors)
+    def _ensure_hydrogen_definitions_loaded(self):
+        """Ensure hydrogen definitions are loaded into C++ once."""
+        if CPP_MODELLER_AVAILABLE and not CppModeller.hasLoadedStandardHydrogens:
+            # Load standard hydrogen definitions from the original implementation
+            from . import modeller_original as original_modeller
+            if not original_modeller.Modeller._hasLoadedStandardHydrogens:
+                original_modeller.Modeller._loadStandardHydrogenDefinitions()
+            
+            # Convert to C++ format and load
+            cpp_residue_data = {}
+            for res_name, res_data in original_modeller.Modeller._residueHydrogens.items():
+                cpp_res_data = CppModeller.ResidueHydrogenData(res_name)
+                cpp_res_data.variants = list(res_data.variants)
+                
+                for h_data in res_data.hydrogens:
+                    cpp_h_def = CppModeller.HydrogenDefinition(
+                        h_data.name, h_data.parent, h_data.maxph,
+                        list(h_data.variants), h_data.terminal
+                    )
+                    cpp_res_data.hydrogens.append(cpp_h_def)
+                
+                cpp_residue_data[res_name] = cpp_res_data
+            
+            CppModeller.loadHydrogenDefinitions(cpp_residue_data)
 
     def _update_from_cpp_modeller(self):
         """Update the Python topology and positions from the C++ modeller."""
@@ -235,13 +265,21 @@ class Modeller(object):
         
         self.topology = new_topology
         self.positions = new_positions
+        
+        # Reset dirty flags
+        self._topology_dirty = False
+        self._positions_dirty = False
 
     def getTopology(self):
         """Get the Topology of the model."""
+        if self._cpp_modeller is not None and self._topology_dirty:
+            self._update_from_cpp_modeller()
         return self.topology
 
     def getPositions(self):
         """Get the atomic positions."""
+        if self._cpp_modeller is not None and self._positions_dirty:
+            self._update_from_cpp_modeller()
         return self.positions
 
     def add(self, addTopology, addPositions):
@@ -259,21 +297,93 @@ class Modeller(object):
             the positions of the atoms to add
         """
         if self._cpp_modeller is not None:
-            # Use C++ implementation
-            # First, convert the topology to add to C++ format
-            temp_modeller = Modeller(addTopology, addPositions)
+            # Use C++ implementation - convert topology directly without creating temporary modeller
             add_chains = []
             add_residues = []
             add_atoms = []
             add_bonds = []
-            temp_modeller._cpp_modeller.getTopology(add_chains, add_residues, add_atoms, add_bonds)
-            add_positions = temp_modeller._cpp_modeller.getPositions()
+            
+            # Build chains
+            for chain_idx, chain in enumerate(addTopology.chains()):
+                cpp_chain = CppModeller.Chain(chain.id, chain_idx)
+                add_chains.append(cpp_chain)
+            
+            # Build residues
+            residue_idx = 0
+            chain_residue_map = {}
+            for chain_idx, chain in enumerate(addTopology.chains()):
+                for residue in chain.residues():
+                    cpp_residue = CppModeller.Residue(
+                        residue.name, residue_idx, chain_idx, 
+                        residue.id, residue.insertionCode
+                    )
+                    add_residues.append(cpp_residue)
+                    chain_residue_map[residue] = residue_idx
+                    add_chains[chain_idx].residueIndices.append(residue_idx)
+                    residue_idx += 1
+            
+            # Build atoms
+            atom_idx = 0
+            residue_atom_map = {}
+            for chain_idx, chain in enumerate(addTopology.chains()):
+                for residue in chain.residues():
+                    res_idx = chain_residue_map[residue]
+                    for atom in residue.atoms():
+                        element_num = 0 if atom.element is None else atom.element.atomic_number
+                        cpp_atom = CppModeller.Atom(
+                            atom.name, element_num, atom_idx, res_idx,
+                            atom.id, atom.formalCharge
+                        )
+                        add_atoms.append(cpp_atom)
+                        residue_atom_map[atom] = atom_idx
+                        add_residues[res_idx].atomIndices.append(atom_idx)
+                        atom_idx += 1
+            
+            # Build bonds
+            for bond in addTopology.bonds():
+                atom1_idx = residue_atom_map[bond[0]]
+                atom2_idx = residue_atom_map[bond[1]]
+                
+                # Convert bond type to integer
+                bond_type = 0
+                bond_order = 0.0
+                if hasattr(bond, 'type') and bond.type is not None:
+                    if str(bond.type) == 'Single':
+                        bond_type = 1
+                        bond_order = 1.0
+                    elif str(bond.type) == 'Double':
+                        bond_type = 2
+                        bond_order = 2.0
+                    elif str(bond.type) == 'Triple':
+                        bond_type = 3
+                        bond_order = 3.0
+                    elif str(bond.type) == 'Aromatic':
+                        bond_type = 4
+                        bond_order = 1.5
+                    elif str(bond.type) == 'Amide':
+                        bond_type = 5
+                        bond_order = 1.0
+                if hasattr(bond, 'order') and bond.order is not None:
+                    bond_order = float(bond.order)
+                
+                cpp_bond = CppModeller.Bond(atom1_idx, atom2_idx, bond_type, bond_order)
+                add_bonds.append(cpp_bond)
+            
+            # Convert positions
+            add_positions_vec = []
+            for pos in addPositions:
+                if is_quantity(pos):
+                    pos_nm = pos.value_in_unit(nanometer)
+                else:
+                    pos_nm = pos
+                add_positions_vec.append(Vec3(pos_nm[0], pos_nm[1], pos_nm[2]))
             
             # Add to our C++ modeller
-            self._cpp_modeller.add(add_chains, add_residues, add_atoms, add_bonds, add_positions)
+            self._cpp_modeller.add(add_chains, add_residues, add_atoms, add_bonds, add_positions_vec)
             
-            # Update Python topology
-            self._update_from_cpp_modeller()
+            # Mark as dirty for lazy sync
+            self._topology_dirty = True
+            self._positions_dirty = True
         else:
             # Fallback to original Python implementation
             self._add_python(addTopology, addPositions)
@@ -354,7 +464,10 @@ class Modeller(object):
                     bonds_to_delete.append((atom_to_index[item[0]], atom_to_index[item[1]]))
             
             self._cpp_modeller.deleteItems(atoms_to_delete, residues_to_delete, chains_to_delete, bonds_to_delete)
-            self._update_from_cpp_modeller()
+            
+            # Mark as dirty for lazy sync
+            self._topology_dirty = True
+            self._positions_dirty = True
         else:
             # Fallback to original Python implementation
             self._delete_python(toDelete)
@@ -395,7 +508,10 @@ class Modeller(object):
         if self._cpp_modeller is not None:
             # Use C++ implementation
             self._cpp_modeller.deleteWater()
-            self._update_from_cpp_modeller()
+            
+            # Mark as dirty for lazy sync
+            self._topology_dirty = True
+            self._positions_dirty = True
         else:
             # Fallback to Python implementation
             self.delete(res for res in self.topology.residues() if res.name == "HOH")
@@ -410,9 +526,11 @@ class Modeller(object):
         # Update our state
         self.topology = temp_modeller.topology
         self.positions = temp_modeller.positions
-        # Recreate C++ modeller if available
+        # Recreate C++ modeller efficiently by updating it rather than recreating
         if CPP_MODELLER_AVAILABLE:
             self._cpp_modeller = self._create_cpp_modeller()
+            self._topology_dirty = False
+            self._positions_dirty = False
 
     def addSolvent(self, forcefield, model='tip3p', boxSize=None, boxVectors=None, padding=None, numAdded=None, boxShape='cube', positiveIon='Na+', negativeIon='Cl-', ionicStrength=0*molar, neutralize=True, residueTemplates=dict()):
         # Import the original implementation
@@ -423,9 +541,11 @@ class Modeller(object):
         # Update our state
         self.topology = temp_modeller.topology
         self.positions = temp_modeller.positions
-        # Recreate C++ modeller if available
-        if CPP_MODELLER_AVAILABLE:
+        # Recreate C++ modeller efficiently - only if we had one before
+        if self._cpp_modeller is not None:
             self._cpp_modeller = self._create_cpp_modeller()
+            self._topology_dirty = False
+            self._positions_dirty = False
 
     def addHydrogens(self, forcefield, pH=7.0, variants=None, platform=None, residueTemplates=dict()):
         # Import the original implementation
@@ -436,9 +556,11 @@ class Modeller(object):
         # Update our state
         self.topology = temp_modeller.topology
         self.positions = temp_modeller.positions
-        # Recreate C++ modeller if available
-        if CPP_MODELLER_AVAILABLE:
+        # Recreate C++ modeller efficiently - only if we had one before  
+        if self._cpp_modeller is not None:
             self._cpp_modeller = self._create_cpp_modeller()
+            self._topology_dirty = False
+            self._positions_dirty = False
         return result
 
     def addExtraParticles(self, forcefield, ignoreExternalBonds=False, residueTemplates=dict()):
@@ -450,9 +572,11 @@ class Modeller(object):
         # Update our state
         self.topology = temp_modeller.topology
         self.positions = temp_modeller.positions
-        # Recreate C++ modeller if available
-        if CPP_MODELLER_AVAILABLE:
+        # Recreate C++ modeller efficiently - only if we had one before
+        if self._cpp_modeller is not None:
             self._cpp_modeller = self._create_cpp_modeller()
+            self._topology_dirty = False
+            self._positions_dirty = False
 
     def addMembrane(self, forcefield, lipidType='POPC', membraneCenterZ=0*nanometer, minimumPadding=1*nanometer, positiveIon='Na+', negativeIon='Cl-', ionicStrength=0*molar, neutralize=True, residueTemplates=dict(), platform=None):
         # Import the original implementation
@@ -463,9 +587,11 @@ class Modeller(object):
         # Update our state
         self.topology = temp_modeller.topology
         self.positions = temp_modeller.positions
-        # Recreate C++ modeller if available
-        if CPP_MODELLER_AVAILABLE:
+        # Recreate C++ modeller efficiently - only if we had one before
+        if self._cpp_modeller is not None:
             self._cpp_modeller = self._create_cpp_modeller()
+            self._topology_dirty = False
+            self._positions_dirty = False
 
     @staticmethod
     def loadHydrogenDefinitions(file):
@@ -488,7 +614,7 @@ class Modeller(object):
         from . import modeller_original as original_modeller
         original_modeller.Modeller.loadHydrogenDefinitions(file)
         
-        # Also load into C++ if available
+        # Also load into C++ if available - but do it efficiently
         if CPP_MODELLER_AVAILABLE:
             # Convert the loaded hydrogen definitions to C++ format
             cpp_residue_data = {}
@@ -505,6 +631,7 @@ class Modeller(object):
                 
                 cpp_residue_data[res_name] = cpp_res_data
             
+            # Load all definitions at once
             CppModeller.loadHydrogenDefinitions(cpp_residue_data)
 
 # Initialize the class static members by delegating to the original implementation
