@@ -318,6 +318,8 @@ private:
                                std::vector<Bond>& newBonds);
     Vec3 calculateHydrogenPosition(int parentAtomIdx,
                                   const std::unordered_map<int, std::vector<int>>& bondedAtoms);
+    Vec3 calculateHydrogenPosition(int parentAtomIdx, const std::string& hydrogenName,
+                                  const std::unordered_map<int, std::vector<int>>& bondedAtoms);
 };
 
 } // namespace OpenMM

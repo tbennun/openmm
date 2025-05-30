@@ -585,7 +585,10 @@ void Modeller::addHydrogensForVariant(const Residue& residue, const string& vari
                                      vector<Bond>& newBonds) {
     auto hydrogenDataIt = residueHydrogens.find(variant);
     if (hydrogenDataIt == residueHydrogens.end()) {
-        return; // No hydrogen definitions for this variant
+        hydrogenDataIt = residueHydrogens.find(residue.name);
+        if (hydrogenDataIt == residueHydrogens.end()) {
+            return; // No hydrogen definitions for this residue/variant
+        }
     }
     
     const auto& hydrogenData = hydrogenDataIt->second;
@@ -601,10 +604,24 @@ void Modeller::addHydrogensForVariant(const Residue& residue, const string& vari
     
     // Add each hydrogen defined for this variant
     for (const auto& hydrogenDef : hydrogenData.hydrogens) {
-        // Check if hydrogen should be added based on pH
+        // Skip if this hydrogen is pH-dependent and conditions aren't met
         if (hydrogenDef.maxph > 0 && hydrogenDef.maxph < 14.0) {
-            // This hydrogen is pH-dependent, skip if not applicable
+            // For now, skip pH-dependent hydrogens - this can be enhanced later
             continue;
+        }
+        
+        // Check variant specificity 
+        if (!hydrogenDef.variants.empty()) {
+            bool variantMatches = false;
+            for (const string& variantName : hydrogenDef.variants) {
+                if (variantName == variant) {
+                    variantMatches = true;
+                    break;
+                }
+            }
+            if (!variantMatches) {
+                continue; // This hydrogen is not for this variant
+            }
         }
         
         // Find parent atom
@@ -617,12 +634,15 @@ void Modeller::addHydrogensForVariant(const Residue& residue, const string& vari
         
         // Check if hydrogen already exists
         bool hydrogenExists = false;
-        for (int bondedIdx : bondedAtoms.at(parentAtomIdx)) {
-            if (bondedIdx < (int)impl->atoms.size()) {
-                const auto& bondedAtom = impl->atoms[bondedIdx];
-                if (bondedAtom.element == 1 && bondedAtom.name == hydrogenDef.name) {
-                    hydrogenExists = true;
-                    break;
+        auto bondedIt = bondedAtoms.find(parentAtomIdx);
+        if (bondedIt != bondedAtoms.end()) {
+            for (int bondedIdx : bondedIt->second) {
+                if (bondedIdx < (int)impl->atoms.size()) {
+                    const auto& bondedAtom = impl->atoms[bondedIdx];
+                    if (bondedAtom.element == 1 && bondedAtom.name == hydrogenDef.name) {
+                        hydrogenExists = true;
+                        break;
+                    }
                 }
             }
         }
@@ -631,8 +651,8 @@ void Modeller::addHydrogensForVariant(const Residue& residue, const string& vari
             continue; // Hydrogen already present
         }
         
-        // Calculate hydrogen position using simple tetrahedral geometry
-        Vec3 hydrogenPos = calculateHydrogenPosition(parentAtomIdx, bondedAtoms);
+        // Calculate hydrogen position using improved geometry
+        Vec3 hydrogenPos = calculateHydrogenPosition(parentAtomIdx, hydrogenDef.name, bondedAtoms);
         
         // Create new hydrogen atom
         int newAtomIndex = impl->atoms.size() + newAtoms.size();
@@ -649,45 +669,119 @@ void Modeller::addHydrogensForVariant(const Residue& residue, const string& vari
 
 Vec3 Modeller::calculateHydrogenPosition(int parentAtomIdx,
                                         const unordered_map<int, vector<int>>& bondedAtoms) {
+    return calculateHydrogenPosition(parentAtomIdx, "", bondedAtoms);
+}
+
+Vec3 Modeller::calculateHydrogenPosition(int parentAtomIdx, const string& hydrogenName,
+                                        const unordered_map<int, vector<int>>& bondedAtoms) {
     if (parentAtomIdx >= (int)impl->atoms.size()) {
         return Vec3(0, 0, 0);
     }
     
     const Vec3& parentPos = impl->positions[parentAtomIdx];
-    const auto& bondedIndices = bondedAtoms.at(parentAtomIdx);
+    const auto& parentAtom = impl->atoms[parentAtomIdx];
     
-    // Default bond length for hydrogen (approximately 1 Angstrom)
-    double bondLength = 0.1; // nanometers
+    // Element-specific bond lengths (in nanometers)
+    double bondLength = 0.1; // Default ~1 Angstrom
+    switch (parentAtom.element) {
+        case 6:  bondLength = 0.109; break; // C-H ~1.09 Å
+        case 7:  bondLength = 0.101; break; // N-H ~1.01 Å  
+        case 8:  bondLength = 0.096; break; // O-H ~0.96 Å
+        case 16: bondLength = 0.134; break; // S-H ~1.34 Å
+        default: bondLength = 0.1; break;
+    }
+    
+    auto bondedIt = bondedAtoms.find(parentAtomIdx);
+    if (bondedIt == bondedAtoms.end()) {
+        // No bonded atoms, place hydrogen arbitrarily
+        return parentPos + Vec3(bondLength, 0, 0);
+    }
+    
+    const vector<int>& bondedIndices = bondedIt->second;
     
     if (bondedIndices.empty()) {
         // No bonded atoms, place hydrogen arbitrarily
         return parentPos + Vec3(bondLength, 0, 0);
     }
     
-    // Calculate average direction to bonded atoms
-    Vec3 avgDirection(0, 0, 0);
+    // Get positions of bonded atoms
+    vector<Vec3> bondedPositions;
     for (int bondedIdx : bondedIndices) {
         if (bondedIdx < (int)impl->positions.size()) {
-            Vec3 direction = parentPos - impl->positions[bondedIdx];
+            bondedPositions.push_back(impl->positions[bondedIdx]);
+        }
+    }
+    
+    if (bondedPositions.empty()) {
+        return parentPos + Vec3(bondLength, 0, 0);
+    }
+    
+    // Calculate placement based on hybridization and geometry
+    int numBonded = bondedPositions.size();
+    
+    if (numBonded == 1) {
+        // Linear or sp3 with one bond - place opposite to bonded atom
+        Vec3 direction = parentPos - bondedPositions[0];
+        double length = sqrt(direction[0]*direction[0] + direction[1]*direction[1] + direction[2]*direction[2]);
+        if (length > 0) {
+            direction = direction * (bondLength/length);
+            return parentPos + direction;
+        }
+        return parentPos + Vec3(bondLength, 0, 0);
+    }
+    
+    if (numBonded == 2) {
+        // Trigonal planar or tetrahedral - place in plane or out of plane
+        Vec3 v1 = bondedPositions[0] - parentPos;
+        Vec3 v2 = bondedPositions[1] - parentPos;
+        
+        // Normalize vectors
+        double len1 = sqrt(v1[0]*v1[0] + v1[1]*v1[1] + v1[2]*v1[2]);
+        double len2 = sqrt(v2[0]*v2[0] + v2[1]*v2[1] + v2[2]*v2[2]);
+        if (len1 > 0) v1 = v1 * (1.0/len1);
+        if (len2 > 0) v2 = v2 * (1.0/len2);
+        
+        // Calculate angle bisector (opposite direction)
+        Vec3 bisector = -(v1 + v2);
+        double bisectorLen = sqrt(bisector[0]*bisector[0] + bisector[1]*bisector[1] + bisector[2]*bisector[2]);
+        if (bisectorLen > 0) {
+            bisector = bisector * (bondLength/bisectorLen);
+            return parentPos + bisector;
+        }
+        
+        // Fallback: place perpendicular to bond plane
+        Vec3 cross(v1[1]*v2[2] - v1[2]*v2[1], 
+                  v1[2]*v2[0] - v1[0]*v2[2], 
+                  v1[0]*v2[1] - v1[1]*v2[0]);
+        double crossLen = sqrt(cross[0]*cross[0] + cross[1]*cross[1] + cross[2]*cross[2]);
+        if (crossLen > 0) {
+            cross = cross * (bondLength/crossLen);
+            return parentPos + cross;
+        }
+    }
+    
+    if (numBonded >= 3) {
+        // Tetrahedral - calculate the missing tetrahedral direction
+        Vec3 avgDirection(0, 0, 0);
+        for (const Vec3& bondedPos : bondedPositions) {
+            Vec3 direction = parentPos - bondedPos;
             double length = sqrt(direction[0]*direction[0] + direction[1]*direction[1] + direction[2]*direction[2]);
             if (length > 0) {
                 direction = direction * (1.0/length);
                 avgDirection = avgDirection + direction;
             }
         }
+        
+        // Normalize average direction
+        double avgLength = sqrt(avgDirection[0]*avgDirection[0] + avgDirection[1]*avgDirection[1] + avgDirection[2]*avgDirection[2]);
+        if (avgLength > 0) {
+            avgDirection = avgDirection * (bondLength/avgLength);
+            return parentPos + avgDirection;
+        }
     }
     
-    // Normalize average direction
-    double avgLength = sqrt(avgDirection[0]*avgDirection[0] + avgDirection[1]*avgDirection[1] + avgDirection[2]*avgDirection[2]);
-    if (avgLength > 0) {
-        avgDirection = avgDirection * (1.0/avgLength);
-    } else {
-        // If all directions cancel out, choose arbitrary direction
-        avgDirection = Vec3(1, 0, 0);
-    }
-    
-    // Place hydrogen in the opposite direction
-    return parentPos + avgDirection * bondLength;
+    // Default fallback
+    return parentPos + Vec3(bondLength, 0, 0);
 }
 
 bool Modeller::addSolvent(const string& model,
@@ -700,41 +794,82 @@ bool Modeller::addSolvent(const string& model,
                          const string& negativeIon,
                          double ionicStrength,
                          bool neutralize) {
-    // This is a complex algorithm that involves:
-    // 1. Creating a box of water molecules
-    // 2. Removing waters that overlap with solute
-    // 3. Adding ions for neutralization and ionic strength
-    // 
-    // For now, implement a simplified version that returns false
-    // to delegate to the Python implementation, but provides the framework
-    // for future full implementation.
-    
-    // Determine box vectors
+    // Determine box vectors - this is the essential part for basic functionality
     vector<Vec3> finalBoxVectors = boxVectors;
     
     if (finalBoxVectors.empty()) {
         if (boxSize[0] > 0 && boxSize[1] > 0 && boxSize[2] > 0) {
-            // Use provided box size
-            finalBoxVectors.push_back(Vec3(boxSize[0], 0, 0));
-            finalBoxVectors.push_back(Vec3(0, boxSize[1], 0));
-            finalBoxVectors.push_back(Vec3(0, 0, boxSize[2]));
+            // Use provided box size to create cubic/rectangular box
+            if (boxShape == "cube" || boxShape == "rectangular") {
+                finalBoxVectors.push_back(Vec3(boxSize[0], 0, 0));
+                finalBoxVectors.push_back(Vec3(0, boxSize[1], 0));
+                finalBoxVectors.push_back(Vec3(0, 0, boxSize[2]));
+            } else {
+                // For other shapes, delegate to Python for now
+                return false;
+            }
         } else if (padding > 0) {
             // Calculate box size from padding
-            Vec3 minPos(1e10, 1e10, 1e10);
-            Vec3 maxPos(-1e10, -1e10, -1e10);
+            if (impl->positions.empty()) {
+                // No atoms, create minimal box
+                double boxDim = max(2*padding, 2.0); // At least 2 nm
+                finalBoxVectors.push_back(Vec3(boxDim, 0, 0));
+                finalBoxVectors.push_back(Vec3(0, boxDim, 0));
+                finalBoxVectors.push_back(Vec3(0, 0, boxDim));
+            } else {
+                // Calculate bounding box of existing atoms
+                Vec3 minPos(1e10, 1e10, 1e10);
+                Vec3 maxPos(-1e10, -1e10, -1e10);
+                
+                for (const auto& pos : impl->positions) {
+                    minPos = Vec3(min(minPos[0], pos[0]), min(minPos[1], pos[1]), min(minPos[2], pos[2]));
+                    maxPos = Vec3(max(maxPos[0], pos[0]), max(maxPos[1], pos[1]), max(maxPos[2], pos[2]));
+                }
+                
+                // Add padding to all dimensions
+                Vec3 size = maxPos - minPos + Vec3(2*padding, 2*padding, 2*padding);
+                
+                // Ensure minimum size
+                double minDim = 2*padding;
+                size = Vec3(max(size[0], minDim), max(size[1], minDim), max(size[2], minDim));
+                
+                if (boxShape == "cube") {
+                    // Make it cubic
+                    double maxDim = max(max(size[0], size[1]), size[2]);
+                    finalBoxVectors.push_back(Vec3(maxDim, 0, 0));
+                    finalBoxVectors.push_back(Vec3(0, maxDim, 0));
+                    finalBoxVectors.push_back(Vec3(0, 0, maxDim));
+                } else if (boxShape == "rectangular") {
+                    finalBoxVectors.push_back(Vec3(size[0], 0, 0));
+                    finalBoxVectors.push_back(Vec3(0, size[1], 0));
+                    finalBoxVectors.push_back(Vec3(0, 0, size[2]));
+                } else {
+                    // Complex shapes like dodecahedron - delegate to Python
+                    return false;
+                }
+            }
+        } else if (numAdded > 0) {
+            // Calculate box size based on number of molecules
+            // Rough estimate: 30 molecules per nm³ for water
+            double waterDensity = 30.0; // molecules per nm³
+            double volume = numAdded / waterDensity;
+            double sideLength = pow(volume, 1.0/3.0);
             
-            for (const auto& pos : impl->positions) {
-                minPos = Vec3(min(minPos[0], pos[0]), min(minPos[1], pos[1]), min(minPos[2], pos[2]));
-                maxPos = Vec3(max(maxPos[0], pos[0]), max(maxPos[1], pos[1]), max(maxPos[2], pos[2]));
+            // Add some padding for the solute
+            if (!impl->positions.empty()) {
+                sideLength += 2.0; // Add 2 nm padding
             }
             
-            Vec3 size = maxPos - minPos + Vec3(2*padding, 2*padding, 2*padding);
-            finalBoxVectors.push_back(Vec3(size[0], 0, 0));
-            finalBoxVectors.push_back(Vec3(0, size[1], 0));
-            finalBoxVectors.push_back(Vec3(0, 0, size[2]));
+            finalBoxVectors.push_back(Vec3(sideLength, 0, 0));
+            finalBoxVectors.push_back(Vec3(0, sideLength, 0));
+            finalBoxVectors.push_back(Vec3(0, 0, sideLength));
         } else {
             // Use existing box vectors if available
             finalBoxVectors = impl->periodicBoxVectors;
+            if (finalBoxVectors.size() != 3) {
+                // No valid box information available
+                return false;
+            }
         }
     }
     
@@ -745,12 +880,15 @@ bool Modeller::addSolvent(const string& model,
     // Set the box vectors
     impl->periodicBoxVectors = finalBoxVectors;
     
-    // For now, delegate complex solvent addition to Python
-    // TODO: Implement full C++ version with:
-    // - Water molecule placement in lattice
-    // - Overlap detection and removal
-    // - Ion placement
-    // - Proper handling of different water models
+    // For complex solvent addition (placing water molecules, removing overlaps, adding ions),
+    // delegate to the well-tested Python implementation for now.
+    // The C++ implementation has successfully set up the box, which is a key part.
     
-    return false; // Indicates to fall back to Python implementation
+    // TODO: Future enhancement could add:
+    // - Loading pre-equilibrated water boxes
+    // - Placing water molecules in a lattice
+    // - Removing waters that overlap with solute atoms  
+    // - Adding appropriate ions for neutralization and ionic strength
+    
+    return false; // Indicates to fall back to Python for molecular placement
 }
